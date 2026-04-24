@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+import requests
+import sqlite3
+import argparse
+import settings
+from rich.console import Console
+from rich.table import Table
+
+
+console = Console()
+
+
+def init_db():
+    """Initialise la base de données."""
+    conn = sqlite3.connect(settings.DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS duck_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            site_name TEXT,
+            password TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def write_result(email_address: str, site_name: str = None, password: str = None):
+    """Enregistre un nouvel alias en DB."""
+    conn = sqlite3.connect(settings.DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO duck_aliases (email, site_name, password) VALUES (?, ?, ?)
+        ''', (email_address, site_name, password))
+        conn.commit()
+        console.print("\n[bold green][+][/bold green] Enregistré dans la base de données avec succès.")
+    except sqlite3.IntegrityError:
+        console.print("\n[bold yellow][!][/bold yellow] Cet email existe déjà dans la base de données.")
+    except Exception as e:
+        console.print(f"\n[bold red][x][/bold red] Erreur lors de l'enregistrement en DB : {e}")
+    finally:
+        conn.close()
+
+
+def generate_new_alias():
+    """Génère un nouvel alias via l'API (commande 'new')."""
+    try:
+        console.print("[cyan]Génération en cours...[/cyan]")
+        response = requests.post(settings.API_URL, headers={
+            'Authorization': f'Bearer {settings.AUTH_TOKEN}',
+            'Referer': 'https://duckduckgo.com/',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0',
+            'Origin': 'https://duckduckgo.com'
+        })
+        
+        if response.status_code == 201:
+            result = response.json()
+            email_address = f"{result['address']}@duck.com"
+            console.print(f"\n[bold green]Nouvel alias généré :[/bold green] [bold cyan]{email_address}[/bold cyan]")
+            console.print("-" * 40)
+            
+            site_name = None
+            password = None
+            
+            choix = console.input("Associer à un compte ? ([bold green]o[/bold green]/[bold red]n[/bold red]) : ").strip().lower()
+            if choix in ['o', 'oui', 'y', 'yes']:
+                site_name = console.input("Nom du site (ex: Netflix) : ").strip()
+                password = console.input("Mot de passe : ").strip()
+            
+            write_result(email_address, site_name, password)
+        else:
+            console.print(f"[bold red][x] Erreur API ({response.status_code}):[/bold red] {response.text}")
+
+    except Exception as e:
+        console.print(f"[bold red][x] Erreur réseau ou API :[/bold red] {e}")
+
+
+def get_records(target: str):
+    """Récupère et affiche les alias sous forme de tableau Rich."""
+    conn = sqlite3.connect(settings.DB_PATH)
+    cursor = conn.cursor()
+    
+    # OPTION 1 : Tout afficher en détail
+    if target.lower() == 'all':
+        cursor.execute("SELECT email, site_name, password, created_at FROM duck_aliases ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            console.print("[yellow]La base de données est vide.[/yellow]")
+        else:
+            table = Table(title=f"Tous les Alias ({len(rows)})", show_lines=True, header_style="bold magenta")
+            table.add_column("Email", style="cyan", no_wrap=True)
+            table.add_column("Site", style="green")
+            table.add_column("Mot de passe", style="red")
+            table.add_column("Création", style="dim", justify="right")
+
+            for email, site, pwd, date in rows:
+                table.add_row(
+                    email, 
+                    site if site else "[italic dim]Non défini[/italic dim]", 
+                    pwd if pwd else "[italic dim]Non défini[/italic dim]", 
+                    date
+                )
+            console.print("\n")
+            console.print(table)
+                
+    # OPTION 2 : Liste simple (Emails + Sites uniquement)
+    elif target.lower() == 'mails':
+        cursor.execute("SELECT email, site_name FROM duck_aliases ORDER BY created_at DESC")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            console.print("[yellow]La base de données est vide.[/yellow]")
+        else:
+            table = Table(title=f"Liste des Emails ({len(rows)})", header_style="bold blue")
+            table.add_column("Email", style="cyan", no_wrap=True)
+            table.add_column("Site", style="green")
+
+            for email, site in rows:
+                table.add_row(
+                    email, 
+                    site if site else "[italic dim]Sans site[/italic dim]"
+                )
+            console.print("\n")
+            console.print(table)
+                
+    # OPTION 3 : Recherche spécifique
+    else:
+        cursor.execute("SELECT email, site_name, password, created_at FROM duck_aliases WHERE email LIKE ?", (f"%{target}%",))
+        rows = cursor.fetchall()
+        
+        if not rows:
+            console.print(f"[yellow]Aucun alias trouvé pour : '{target}'[/yellow]")
+        else:
+            table = Table(title=f"Résultat(s) pour '{target}'", show_lines=True, header_style="bold yellow")
+            table.add_column("Email", style="cyan", no_wrap=True)
+            table.add_column("Site", style="green")
+            table.add_column("Mot de passe", style="red")
+            table.add_column("Création", style="dim", justify="right")
+
+            for email, site, pwd, date in rows:
+                table.add_row(
+                    email, 
+                    site if site else "[italic dim]Non défini[/italic dim]", 
+                    pwd if pwd else "[italic dim]Non défini[/italic dim]", 
+                    date
+                )
+            console.print("\n")
+            console.print(table)
+                
+    conn.close()
+
+
+def main():
+    init_db()
+    
+    # Configuration du parseur d'arguments CLI
+    parser = argparse.ArgumentParser(description="🦆 Quack - Gestionnaire d'alias DuckDuckGo")
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Commandes disponibles")
+    
+    # Commande 'new'
+    parser_new = subparsers.add_parser("new", help="Génère un nouvel alias email")
+    
+    # Commande 'get'
+    parser_get = subparsers.add_parser("get", help="Affiche les alias existants")
+    parser_get.add_argument("target", help="'all' (tout), 'mails' (sans mdp), ou l'email recherché")
+    
+    args = parser.parse_args()
+    
+    if args.command == "new":
+        generate_new_alias()
+    elif args.command == "get":
+        get_records(args.target)
+
+
+if __name__ == '__main__':
+    main()
