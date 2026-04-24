@@ -34,3 +34,12 @@ positional arguments:
 options:
   -h, --help  show this help message and exit
 ```
+
+## Tip
+
+Pour quacker partout :
+
+```bash
+chmod +x quack
+sudo ln -s /absolute/path/to/Quack/quack /usr/local/bin/quack
+```
