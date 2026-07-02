@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+import os
+import getpass
+import base64
 import requests
 import sqlite3
 import argparse
 import settings
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from rich.console import Console
 from rich.table import Table
 
@@ -10,26 +16,93 @@ from rich.table import Table
 console = Console()
 
 
-def init_db():
-    """Initialise la base de données."""
-    conn = sqlite3.connect(settings.DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS duck_aliases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            site_name TEXT,
-            password TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+def derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=480000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
 
-def write_result(email_address: str, site_name: str = None, password: str = None):
+def load_or_create_db():
+    """Charge la base de données déchiffrée en mémoire, ou la crée si elle n'existe pas."""
+    db_path = settings.DB_PATH
+    if os.path.exists(db_path):
+        with open(db_path, 'rb') as f:
+            data = f.read()
+            
+        if data[:16] == b'SQLite format 3\x00':
+            console.print("[yellow]Base de données non chiffrée détectée. Migration vers une base chiffrée...[/yellow]")
+            password = getpass.getpass("Définissez votre nouveau mot de passe maître : ")
+            confirm = getpass.getpass("Confirmez le mot de passe : ")
+            if password != confirm:
+                console.print("[bold red]Les mots de passe ne correspondent pas.[/bold red]")
+                exit(1)
+            
+            salt = os.urandom(16)
+            key = derive_key(password, salt)
+            
+            conn = sqlite3.connect(':memory:')
+            conn.deserialize(data)
+            
+            # Sauvegarder directement la version chiffrée
+            save_db(conn, salt, key)
+            console.print("[bold green]Migration terminée. La base est maintenant chiffrée ![/bold green]")
+            return conn, salt, key
+        else:
+            password = getpass.getpass("Mot de passe maître : ")
+            salt = data[:16]
+            encrypted_db = data[16:]
+            key = derive_key(password, salt)
+            fernet = Fernet(key)
+            try:
+                decrypted_db = fernet.decrypt(encrypted_db)
+            except InvalidToken:
+                console.print("[bold red]Mot de passe incorrect ou base corrompue.[/bold red]")
+                exit(1)
+            
+            conn = sqlite3.connect(':memory:')
+            conn.deserialize(decrypted_db)
+            return conn, salt, key
+    else:
+        console.print("[cyan]Création d'une nouvelle base de données chiffrée.[/cyan]")
+        password = getpass.getpass("Définissez votre mot de passe maître : ")
+        confirm = getpass.getpass("Confirmez le mot de passe : ")
+        if password != confirm:
+            console.print("[bold red]Les mots de passe ne correspondent pas.[/bold red]")
+            exit(1)
+            
+        salt = os.urandom(16)
+        key = derive_key(password, salt)
+        conn = sqlite3.connect(':memory:')
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS duck_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                site_name TEXT,
+                password TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        return conn, salt, key
+
+
+def save_db(conn, salt, key):
+    """Chiffre et sauvegarde la base de données sur le disque."""
+    db_path = settings.DB_PATH
+    serialized_db = conn.serialize()
+    fernet = Fernet(key)
+    encrypted_db = fernet.encrypt(serialized_db)
+    with open(db_path, 'wb') as f_out:
+        f_out.write(salt + encrypted_db)
+
+
+def write_result(conn, email_address: str, site_name: str = None, password: str = None):
     """Enregistre un nouvel alias en DB."""
-    conn = sqlite3.connect(settings.DB_PATH)
     cursor = conn.cursor()
     try:
         cursor.execute('''
@@ -41,11 +114,9 @@ def write_result(email_address: str, site_name: str = None, password: str = None
         console.print("\n[bold yellow][!][/bold yellow] Cet email existe déjà dans la base de données.")
     except Exception as e:
         console.print(f"\n[bold red][x][/bold red] Erreur lors de l'enregistrement en DB : {e}")
-    finally:
-        conn.close()
 
 
-def generate_new_alias():
+def generate_new_alias(conn, salt, key):
     """Génère un nouvel alias via l'API (commande 'new')."""
     try:
         console.print("[cyan]Génération en cours...[/cyan]")
@@ -70,7 +141,8 @@ def generate_new_alias():
                 site_name = console.input("Nom du site (ex: Netflix) : ").strip()
                 password = console.input("Mot de passe : ").strip()
             
-            write_result(email_address, site_name, password)
+            write_result(conn, email_address, site_name, password)
+            save_db(conn, salt, key)
         else:
             console.print(f"[bold red][x] Erreur API ({response.status_code}):[/bold red] {response.text}")
 
@@ -78,9 +150,8 @@ def generate_new_alias():
         console.print(f"[bold red][x] Erreur réseau ou API :[/bold red] {e}")
 
 
-def get_records(target: str):
+def get_records(conn, target: str):
     """Récupère et affiche les alias sous forme de tableau Rich."""
-    conn = sqlite3.connect(settings.DB_PATH)
     cursor = conn.cursor()
     
     # OPTION 1 : Tout afficher en détail
@@ -150,13 +221,9 @@ def get_records(target: str):
                 )
             console.print("\n")
             console.print(table)
-                
-    conn.close()
 
 
 def main():
-    init_db()
-    
     # Configuration du parseur d'arguments CLI
     parser = argparse.ArgumentParser(description="🦆 Quack - Gestionnaire d'alias DuckDuckGo")
     subparsers = parser.add_subparsers(dest="command", required=True, help="Commandes disponibles")
@@ -170,10 +237,13 @@ def main():
     
     args = parser.parse_args()
     
+    # Charge la base de données
+    conn, salt, key = load_or_create_db()
+    
     if args.command == "new":
-        generate_new_alias()
+        generate_new_alias(conn, salt, key)
     elif args.command == "get":
-        get_records(args.target)
+        get_records(conn, args.target)
 
 
 if __name__ == '__main__':
