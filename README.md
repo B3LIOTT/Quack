@@ -5,8 +5,11 @@
 ### Duck Email Privacy
 
 S'inscrire sur Duck Email Privacy [ici](https://duckduckgo.com/email/signup).
+
 Aller sur le dashboard [ici](https://duckduckgo.com/email/settings/autofill).
+
 Ouvrir le devtool, cliquer sur Generate Private Duck Address, et identifer la requête POST. Le token API est dans le auth header.
+
 Ajouter le token récupéré dans le `.env` du projet.
 
 ### Dépendances
